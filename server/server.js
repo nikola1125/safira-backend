@@ -233,9 +233,9 @@ const Booking = mongoose.model('Booking', new mongoose.Schema({
     customerName: String,
     customerEmail: String,
     customerPhone: String,
-    paymentStatus: { type: String, default: 'pending' },
+    paymentStatus: {type: String, default: 'pending'},
     payseraOrderId: String,
-    createdAt: { type: Date, default: Date.now }
+    createdAt: {type: Date, default: Date.now}
 }));
 
 // Room types and pricing
@@ -244,31 +244,31 @@ const ROOM_TYPES = {
         name: 'Deluxe Double Room',
         capacities: [2],
         rates: {
-            2: { withoutBreakfast: 50, withBreakfast: 55 }
+            2: {withoutBreakfast: 50, withBreakfast: 55}
         }
     },
     'deluxe-double-balcony': {
         name: 'Deluxe Double Room With Balcony',
         capacities: [2, 3],
         rates: {
-            2: { withoutBreakfast: 60, withBreakfast: 65 },
-            3: { withoutBreakfast: 75, withBreakfast: 80 }
+            2: {withoutBreakfast: 60, withBreakfast: 65},
+            3: {withoutBreakfast: 75, withBreakfast: 80}
         }
     },
     'triple-garden': {
         name: 'Triple Room with garden view',
         capacities: [2, 3],
         rates: {
-            2: { withoutBreakfast: 60, withBreakfast: 65 },
-            3: { withoutBreakfast: 75, withBreakfast: 80 }
+            2: {withoutBreakfast: 60, withBreakfast: 65},
+            3: {withoutBreakfast: 75, withBreakfast: 80}
         }
     },
     'deluxe-family': {
         name: 'Deluxe Family Suite',
         capacities: [3, 4],
         rates: {
-            3: { withoutBreakfast: 80, withBreakfast: 85 },
-            4: { withoutBreakfast: 95, withBreakfast: 100 }
+            3: {withoutBreakfast: 80, withBreakfast: 85},
+            4: {withoutBreakfast: 95, withBreakfast: 100}
         }
     }
 };
@@ -324,12 +324,12 @@ function calculateTotal(roomType, guests, breakfast, nights) {
 
 // API endpoint to check availability and get price
 app.post('/api/check-availability', async (req, res) => {
-    const { roomType, checkIn, checkOut, guests, breakfast } = req.body;
+    const {roomType, checkIn, checkOut, guests, breakfast} = req.body;
 
     try {
         const available = await checkAvailability(roomType, checkIn, checkOut);
         if (!available) {
-            return res.json({ available: false });
+            return res.json({available: false});
         }
 
         const checkInDate = new Date(checkIn);
@@ -346,19 +346,19 @@ app.post('/api/check-availability', async (req, res) => {
         });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({error: 'Server error'});
     }
 });
 
 // Paysera payment integration
 app.post('/api/create-payment', async (req, res) => {
-    const { roomType, checkIn, checkOut, guests, breakfast, customerInfo } = req.body;
+    const {roomType, checkIn, checkOut, guests, breakfast, customerInfo} = req.body;
 
     try {
         // Verify availability again before payment
         const available = await checkAvailability(roomType, checkIn, checkOut);
         if (!available) {
-            return res.status(400).json({ error: 'Room no longer available' });
+            return res.status(400).json({error: 'Room no longer available'});
         }
 
         const checkInDate = new Date(checkIn);
@@ -428,13 +428,13 @@ app.post('/api/create-payment', async (req, res) => {
         });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({error: 'Server error'});
     }
 });
 
 // Paysera callback handler
 app.post('/api/payment-callback', async (req, res) => {
-    const { data, ss1 } = req.body;
+    const {data, ss1} = req.body;
 
     try {
         // Verify the callback signature
@@ -453,7 +453,7 @@ app.post('/api/payment-callback', async (req, res) => {
         const status = params.get('status');
 
         // Update booking status
-        const booking = await Booking.findOne({ payseraOrderId: orderId });
+        const booking = await Booking.findOne({payseraOrderId: orderId});
         if (booking) {
             booking.paymentStatus = status === '1' ? 'completed' : 'failed';
             await booking.save();
@@ -471,12 +471,33 @@ app.get('/api/booking/:id', async (req, res) => {
     try {
         const booking = await Booking.findById(req.params.id);
         if (!booking) {
-            return res.status(404).json({ error: 'Booking not found' });
+            return res.status(404).json({error: 'Booking not found'});
         }
         res.json(booking);
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: 'Server error' });
+        res.status(500).json({error: 'Server error'});
+    }
+});
+app.get('/api/booked-dates', async (req, res) => {
+    try {
+        const events = await getCalendarData();
+        const bookedDates = [];
+
+        for (const eventId in events) {
+            const event = events[eventId];
+            if (event.type === 'VEVENT') {
+                bookedDates.push({
+                    start: new Date(event.start),
+                    end: new Date(event.end)
+                });
+            }
+        }
+
+        res.json(bookedDates);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({error: 'Server error'});
     }
 });
 
