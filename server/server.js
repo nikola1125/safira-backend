@@ -276,7 +276,7 @@ const ROOM_TYPES = {
 // Fetch and parse iCal data
 async function getCalendarData() {
     try {
-        const response = await axios.get('https://ical.booking.com/v1/export?t=38bb6782-e96c-4e15-9e0e-763f7aca9ea5');
+        const response = await axios.get(process.env.BOOKING_CALENDAR_URL);
         return ical.parseICS(response.data);
     } catch (error) {
         console.error('Error fetching iCal data:', error);
