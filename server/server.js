@@ -5,7 +5,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const ical = require('node-ical');
-const {differenceInDays, parseISO, isValid} = require('date-fns');
+const { differenceInDays, parseISO, isValid } = require('date-fns');
 
 const app = express();
 app.use(cors());
@@ -34,7 +34,7 @@ const reviewSchema = new mongoose.Schema({
     email: String,
     rating: Number,
     comment: String,
-    createdAt: {type: Date, default: Date.now}
+    createdAt: { type: Date, default: Date.now }
 });
 
 const Booking = mongoose.model('Booking', bookingSchema);
@@ -45,31 +45,31 @@ const ROOM_TYPES = {
         name: 'Deluxe Double Room',
         capacities: [2],
         rates: {
-            2: {withoutBreakfast: 50, withBreakfast: 55}
+            2: { withoutBreakfast: 50, withBreakfast: 55 }
         }
     },
     'deluxe-double-balcony': {
         name: 'Deluxe Double Room With Balcony',
         capacities: [2, 3],
         rates: {
-            2: {withoutBreakfast: 60, withBreakfast: 65},
-            3: {withoutBreakfast: 75, withBreakfast: 80}
+            2: { withoutBreakfast: 60, withBreakfast: 65 },
+            3: { withoutBreakfast: 75, withBreakfast: 80 }
         }
     },
     'triple-garden': {
         name: 'Triple Room with garden view',
         capacities: [2, 3],
         rates: {
-            2: {withoutBreakfast: 60, withBreakfast: 65},
-            3: {withoutBreakfast: 75, withBreakfast: 80}
+            2: { withoutBreakfast: 60, withBreakfast: 65 },
+            3: { withoutBreakfast: 75, withBreakfast: 80 }
         }
     },
     'deluxe-family': {
         name: 'Deluxe Family Suite',
         capacities: [3, 4],
         rates: {
-            3: {withoutBreakfast: 80, withBreakfast: 85},
-            4: {withoutBreakfast: 95, withBreakfast: 100}
+            3: { withoutBreakfast: 80, withBreakfast: 85 },
+            4: { withoutBreakfast: 95, withBreakfast: 100 }
         }
     }
 };
@@ -118,32 +118,32 @@ app.get('/api/booked-dates', async (req, res) => {
         const bookedDates = await getBookedDates();
         res.json(bookedDates);
     } catch (error) {
-        res.status(500).json({error: 'Failed to fetch booked dates'});
+        res.status(500).json({ error: 'Failed to fetch booked dates' });
     }
 });
 
 app.post('/api/check-availability', async (req, res) => {
     try {
-        const {roomType, checkIn, checkOut, guests, breakfast} = req.body;
+        const { roomType, checkIn, checkOut, guests, breakfast } = req.body;
 
         if (!ROOM_TYPES[roomType]) {
-            return res.status(400).json({error: 'Invalid room type'});
+            return res.status(400).json({ error: 'Invalid room type' });
         }
 
         if (!ROOM_TYPES[roomType].capacities.includes(Number(guests))) {
-            return res.status(400).json({error: 'Invalid guest count for this room'});
+            return res.status(400).json({ error: 'Invalid guest count for this room' });
         }
 
         const parsedCheckIn = parseISO(checkIn);
         const parsedCheckOut = parseISO(checkOut);
 
         if (!isValid(parsedCheckIn) || !isValid(parsedCheckOut)) {
-            return res.status(400).json({error: 'Invalid dates'});
+            return res.status(400).json({ error: 'Invalid dates' });
         }
 
         const available = await isDateAvailable(parsedCheckIn, parsedCheckOut);
         if (!available) {
-            return res.json({available: false});
+            return res.json({ available: false });
         }
 
         const nights = differenceInDays(parsedCheckOut, parsedCheckIn);
@@ -157,17 +157,17 @@ app.post('/api/check-availability', async (req, res) => {
             roomName: ROOM_TYPES[roomType].name
         });
     } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 app.post('/api/create-payment', async (req, res) => {
     try {
-        const {roomType, checkIn, checkOut, guests, breakfast, customerInfo} = req.body;
+        const { roomType, checkIn, checkOut, guests, breakfast, customerInfo } = req.body;
 
         const available = await isDateAvailable(parseISO(checkIn), parseISO(checkOut));
         if (!available) {
-            return res.status(400).json({error: 'Selected dates are no longer available'});
+            return res.status(400).json({ error: 'Selected dates are no longer available' });
         }
 
         const nights = differenceInDays(parseISO(checkOut), parseISO(checkIn));
@@ -191,27 +191,27 @@ app.post('/api/create-payment', async (req, res) => {
             paymentUrl: `${process.env.PAYMENT_URL}?amount=${total}&bookingId=${booking._id}`
         });
     } catch (error) {
-        res.status(500).json({error: 'Failed to create payment'});
+        res.status(500).json({ error: 'Failed to create payment' });
     }
 });
 
 app.post('/api/reviews', async (req, res) => {
     try {
-        const {name, email, rating, comment} = req.body;
-        const review = new Review({name, email, rating, comment});
+        const { name, email, rating, comment } = req.body;
+        const review = new Review({ name, email, rating, comment });
         await review.save();
         res.json(review);
     } catch (error) {
-        res.status(500).json({error: 'Failed to save review'});
+        res.status(500).json({ error: 'Failed to save review' });
     }
 });
 
 app.get('/api/reviews', async (req, res) => {
     try {
-        const reviews = await Review.find().sort({createdAt: -1});
+        const reviews = await Review.find().sort({ createdAt: -1 });
         res.json(reviews);
     } catch (error) {
-        res.status(500).json({error: 'Failed to fetch reviews'});
+        res.status(500).json({ error: 'Failed to fetch reviews' });
     }
 });
 
