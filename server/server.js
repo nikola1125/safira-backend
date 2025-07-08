@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
@@ -6,36 +5,29 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const ical = require('node-ical');
-const crypto = require('crypto');
+const { format, parseISO, isValid, differenceInDays } = require('date-fns');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// Enhanced MongoDB connection
 mongoose.connect(process.env.MONGODB_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
+    retryWrites: true,
+    w: 'majority'
+}).catch(err => {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
 });
 
-const Booking = mongoose.model('Booking', new mongoose.Schema({
-    roomType: String,
-    checkIn: Date,
-    checkOut: Date,
-    guests: Number,
-    breakfast: Boolean,
-    totalPrice: Number,
-    customerName: String,
-    customerEmail: String,
-    customerPhone: String,
-    paymentStatus: String,
-    payseraOrderId: String,
-}));
-
+// Room types configuration
 const ROOM_TYPES = {
     'deluxe-double': {
         name: 'Deluxe Double Room',
         capacities: [2],
-        rates: { 2: { withoutBreakfast: 50, withBreakfast: 55 } },
+        rates: { 2: { withoutBreakfast: 50, withBreakfast: 55 } }
     },
     'deluxe-double-balcony': {
         name: 'Deluxe Double Room With Balcony',
@@ -63,36 +55,75 @@ const ROOM_TYPES = {
     }
 };
 
+// Enhanced Booking Schema
+const bookingSchema = new mongoose.Schema({
+    roomType: { type: String, required: true, enum: Object.keys(ROOM_TYPES) },
+    checkIn: { type: Date, required: true, validate: [isValid, 'Invalid check-in date'] },
+    checkOut: { type: Date, required: true, validate: [isValid, 'Invalid check-out date'] },
+    guests: { type: Number, min: 1, max: 4, required: true },
+    breakfast: { type: Boolean, required: true },
+    totalPrice: { type: Number, min: 0, required: true },
+    customerInfo: {
+        name: { type: String, required: true },
+        email: { type: String, required: true },
+        phone: { type: String, required: true }
+    },
+    paymentStatus: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' }
+}, { timestamps: true });
+
+const Booking = mongoose.model('Booking', bookingSchema);
+
+// Date validation middleware
+const validateDates = (req, res, next) => {
+    try {
+        const checkIn = parseISO(req.body.checkIn);
+        const checkOut = parseISO(req.body.checkOut);
+
+        if (!isValid(checkIn)) throw new Error('Invalid check-in date');
+        if (!isValid(checkOut)) throw new Error('Invalid check-out date');
+        if (checkOut <= checkIn) throw new Error('Check-out must be after check-in');
+
+        req.validDates = { checkIn, checkOut };
+        next();
+    } catch (error) {
+        res.status(400).json({ error: error.message });
+    }
+};
+
+// Get booked dates from external calendar
 async function getCalendarData() {
     try {
-        const response = await axios.get("https://ical.booking.com/v1/export?t=38bb6782-e96c-4e15-9e0e-763f7aca9ea5", {
-            responseType: 'text'
+        const response = await axios.get(process.env.BOOKING_CALENDAR_URL || "https://ical.booking.com/v1/export?t=38bb6782-e96c-4e15-9e0e-763f7aca9ea5", {
+            responseType: 'text',
+            timeout: 5000
         });
         return ical.parseICS(response.data);
     } catch (e) {
-        console.error(e);
+        console.error('Calendar fetch error:', e);
         return {};
     }
 }
 
+// Check room availability
 async function checkAvailability(roomType, checkIn, checkOut) {
-    const events = await getCalendarData();
-    const inDate = new Date(checkIn);
-    const outDate = new Date(checkOut);
-    for (let d = new Date(inDate); d < outDate; d.setDate(d.getDate() + 1)) {
-        for (const eId in events) {
-            const e = events[eId];
-            if (e.type === 'VEVENT' && new Date(e.start) <= d && d < new Date(e.end)) return false;
+    try {
+        const events = await getCalendarData();
+        for (let d = new Date(checkIn); d < checkOut; d.setDate(d.getDate() + 1)) {
+            for (const eId in events) {
+                const e = events[eId];
+                if (e.type === 'VEVENT' && new Date(e.start) <= d && d < new Date(e.end)) {
+                    return false;
+                }
+            }
         }
+        return true;
+    } catch (e) {
+        console.error('Availability check error:', e);
+        return false;
     }
-    return true;
 }
 
-function calculateTotal(roomType, guests, breakfast, nights) {
-    const rate = ROOM_TYPES[roomType].rates[guests];
-    return (breakfast ? rate.withBreakfast : rate.withoutBreakfast) * nights;
-}
-
+// API Endpoints
 app.get('/api/booked-dates', async (req, res) => {
     try {
         const events = await getCalendarData();
@@ -100,73 +131,99 @@ app.get('/api/booked-dates', async (req, res) => {
         for (const key in events) {
             const e = events[key];
             if (e.type === 'VEVENT') {
-                booked.push({ start: e.start, end: e.end });
+                booked.push({
+                    start: e.start,
+                    end: e.end
+                });
             }
         }
         res.json(booked);
     } catch (e) {
-        res.status(500).send('Error');
+        console.error('Booked dates error:', e);
+        res.status(500).json({ error: 'Failed to fetch booked dates' });
     }
 });
 
-app.post('/api/check-availability', async (req, res) => {
-    const { roomType, checkIn, checkOut, guests, breakfast } = req.body;
-    const available = await checkAvailability(roomType, checkIn, checkOut);
-    if (!available) return res.json({ available: false });
+app.post('/api/check-availability', validateDates, async (req, res) => {
+    try {
+        const { roomType, guests, breakfast } = req.body;
+        const { checkIn, checkOut } = req.validDates;
 
-    const nights = Math.ceil((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24));
-    const total = calculateTotal(roomType, guests, breakfast, nights);
-    res.json({ available: true, nights, total, roomName: ROOM_TYPES[roomType].name });
+        if (!ROOM_TYPES[roomType]) {
+            return res.status(400).json({ error: 'Invalid room type' });
+        }
+
+        if (!ROOM_TYPES[roomType].capacities.includes(Number(guests))) {
+            return res.status(400).json({ error: 'Invalid guest count for this room' });
+        }
+
+        const isAvailable = await checkAvailability(roomType, checkIn, checkOut);
+        if (!isAvailable) {
+            return res.json({ available: false });
+        }
+
+        const nights = differenceInDays(checkOut, checkIn);
+        const rate = ROOM_TYPES[roomType].rates[guests];
+        const total = (breakfast ? rate.withBreakfast : rate.withoutBreakfast) * nights;
+
+        res.json({
+            available: true,
+            nights,
+            total,
+            roomName: ROOM_TYPES[roomType].name
+        });
+    } catch (error) {
+        console.error('Availability check error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
-app.post('/api/create-payment', async (req, res) => {
-    const { roomType, checkIn, checkOut, guests, breakfast, customerInfo } = req.body;
-    const available = await checkAvailability(roomType, checkIn, checkOut);
-    if (!available) return res.status(400).json({ error: 'Room no longer available' });
+app.post('/api/create-payment', validateDates, async (req, res) => {
+    try {
+        const { roomType, guests, breakfast, customerInfo } = req.body;
+        const { checkIn, checkOut } = req.validDates;
 
-    const nights = Math.ceil((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24));
-    const total = calculateTotal(roomType, guests, breakfast, nights);
+        // Verify availability again
+        const isAvailable = await checkAvailability(roomType, checkIn, checkOut);
+        if (!isAvailable) {
+            return res.status(400).json({ error: 'Room no longer available' });
+        }
 
-    const booking = await Booking.create({
-        roomType,
-        checkIn,
-        checkOut,
-        guests,
-        breakfast,
-        totalPrice: total,
-        customerName: customerInfo.name,
-        customerEmail: customerInfo.email,
-        customerPhone: customerInfo.phone,
-        paymentStatus: 'pending',
-        payseraOrderId: `BOOKING-${Date.now()}`,
-    });
+        // Calculate total
+        const nights = differenceInDays(checkOut, checkIn);
+        const rate = ROOM_TYPES[roomType].rates[guests];
+        const total = (breakfast ? rate.withBreakfast : rate.withoutBreakfast) * nights;
 
-    const paymentData = {
-        projectid: '123456',
-        orderid: booking.payseraOrderId,
-        accepturl: `https://yourwebsite.com/payment/success?bookingId=${booking._id}`,
-        cancelurl: `https://yourwebsite.com/payment/cancel?bookingId=${booking._id}`,
-        callbackurl: `https://yourwebsite.com/api/payment-callback`,
-        amount: total * 100,
-        currency: 'EUR',
-        payment: 'NB,CB',
-        lang: 'en',
-        test: '1',
-        p_firstname: customerInfo.name.split(' ')[0],
-        p_lastname: customerInfo.name.split(' ').slice(1).join(' '),
-        p_email: customerInfo.email,
-        p_phone: customerInfo.phone,
-    };
+        // Create booking record
+        const booking = await Booking.create({
+            roomType,
+            checkIn,
+            checkOut,
+            guests,
+            breakfast,
+            totalPrice: total,
+            customerInfo,
+            paymentStatus: 'pending'
+        });
 
-    const signData = Object.entries(paymentData)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-        .join('&');
-    const ss1 = crypto.createHash('md5').update(signData + 'your_sign_password').digest('hex');
-    paymentData.sign = ss1;
+        // Generate payment URL (replace with your actual payment integration)
+        const paymentUrl = `https://payment-provider.com/pay?amount=${total}&bookingId=${booking._id}`;
 
-    res.json({ paymentUrl: `https://bank.paysera.com/pay/?${new URLSearchParams(paymentData).toString()}` });
+        res.json({ paymentUrl });
+    } catch (error) {
+        console.error('Payment creation error:', error);
+        res.status(500).json({ error: 'Failed to create payment' });
+    }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log('Database:', mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected');
+});
