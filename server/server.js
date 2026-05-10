@@ -5,17 +5,26 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const ical = require('node-ical');
-const { differenceInDays, parseISO, isValid } = require('date-fns');
+const {differenceInDays, parseISO, isValid} = require('date-fns');
 const nodemailer = require('nodemailer');
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+// const app = express();
+// app.use(cors());
+// app.use(bodyParser.json());
+//
+// mongoose.connect(process.env.MONGODB_URI, {
+//     useNewUrlParser: true,
+//     useUnifiedTopology: true
+// });
 
-mongoose.connect(process.env.MONGODB_URI, {
-    useNewUrlParser: true,
+const app = express()
+app.use(cors())
+app.use(bodyParser.json())
+
+mongoose.connect(process.env.MONGODB_URI,{
+    useNewUrlParser:true,
     useUnifiedTopology: true
-});
+})
 
 const bookingSchema = new mongoose.Schema({
     roomType: String,
@@ -27,17 +36,17 @@ const bookingSchema = new mongoose.Schema({
     customerName: String,
     customerEmail: String,
     customerPhone: String,
-    paymentStatus: { type: String, enum: ['pending', 'paid'], default: 'pending' },
+    paymentStatus: {type: String, enum: ['pending', 'paid'], default: 'pending'},
     paymentDate: Date,
     bookingReference: String
-}, { timestamps: true });
+}, {timestamps: true});
 
 const reviewSchema = new mongoose.Schema({
     name: String,
     country: String,
     comment: String,
-    rating: { type: Number, min: 1, max: 5 },
-    createdAt: { type: Date, default: Date.now }
+    rating: {type: Number, min: 1, max: 5},
+    createdAt: {type: Date, default: Date.now}
 });
 
 const Booking = mongoose.model('Booking', bookingSchema);
@@ -55,35 +64,35 @@ const transporter = nodemailer.createTransport({
 });
 
 const ROOM_TYPES = {
-    'deluxe-double': {
+    'room_type_1': {
         name: 'Deluxe Double Room',
         capacities: [2],
         rates: {
-            2: { withoutBreakfast: 50, withBreakfast: 55 }
+            2: {withoutBreakfast: 50, withBreakfast: 55}
         }
     },
-    'deluxe-double-balcony': {
+    'room_type_2': {
         name: 'Deluxe Double Room With Balcony',
         capacities: [2, 3],
         rates: {
-            2: { withoutBreakfast: 60, withBreakfast: 65 },
-            3: { withoutBreakfast: 75, withBreakfast: 80 }
+            2: {withoutBreakfast: 60, withBreakfast: 65},
+            3: {withoutBreakfast: 75, withBreakfast: 80}
         }
     },
-    'triple-garden': {
+    'room_type_3': {
         name: 'Triple Room with garden view',
         capacities: [2, 3],
         rates: {
-            2: { withoutBreakfast: 60, withBreakfast: 65 },
-            3: { withoutBreakfast: 75, withBreakfast: 80 }
+            2: {withoutBreakfast: 60, withBreakfast: 65},
+            3: {withoutBreakfast: 75, withBreakfast: 80}
         }
     },
-    'deluxe-family': {
+    'room_type_4': {
         name: 'Deluxe Family Suite',
         capacities: [3, 4],
         rates: {
-            3: { withoutBreakfast: 80, withBreakfast: 85 },
-            4: { withoutBreakfast: 95, withBreakfast: 100 }
+            3: {withoutBreakfast: 80, withBreakfast: 85},
+            4: {withoutBreakfast: 95, withBreakfast: 100}
         }
     }
 };
@@ -91,24 +100,25 @@ const ROOM_TYPES = {
 // Function to sync with Booking.com
 async function syncWithBookingDotCom() {
     try {
-        const response = await axios.get(process.env.BOOKING_DOT_COM_API_URL, {
+        const response = await axios.get(`${process.env.BOOKING_CALENDAR_URL}/availability`, {
             headers: {
                 'Authorization': `Bearer ${process.env.BOOKING_DOT_COM_API_KEY}`
+            },
+            params: {
+                hotel_id: process.env.HOTEL_ID,
+                // Add other required parameters
             }
         });
 
-        // Process the response and update our database
-        const bookings = response.data.bookings.map(booking => ({
-            start: new Date(booking.start_date),
-            end: new Date(booking.end_date),
-            roomType: booking.room_type,
-            status: booking.status
+        // Process the availability response
+        const availableRooms = response.data.rooms.map(room => ({
+            id: room.room_type_id,
+            name: room.room_name,
+            available: room.available,
+            rates: room.rates
         }));
 
-        // Here you would typically update your database with the new bookings
-        console.log('Synced with Booking.com:', bookings.length, 'bookings fetched');
-
-        return bookings;
+        return availableRooms;
     } catch (error) {
         console.error('Error syncing with Booking.com:', error);
         return [];
@@ -235,56 +245,67 @@ app.get('/api/booked-dates', async (req, res) => {
         const bookedDates = await getBookedDates();
         res.json(bookedDates);
     } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch booked dates' });
+        res.status(500).json({error: 'Failed to fetch booked dates'});
     }
 });
 
 app.post('/api/check-availability', async (req, res) => {
     try {
-        const { roomType, checkIn, checkOut, guests, breakfast } = req.body;
+        const { checkIn, checkOut, guests, breakfast } = req.body;
 
-        if (!ROOM_TYPES[roomType]) {
-            return res.status(400).json({ error: 'Invalid room type' });
-        }
+        // Get availability from Booking.com
+        const bookingDotComAvailability = await syncWithBookingDotCom();
 
-        if (!ROOM_TYPES[roomType].capacities.includes(Number(guests))) {
-            return res.status(400).json({ error: 'Invalid guest count for this room' });
-        }
+        // Combine with our local room types
+        const allRooms = Object.entries(ROOM_TYPES).map(([id, room]) => {
+            const bookingDotComRoom = bookingDotComAvailability.find(r => r.id === id);
+            return {
+                ...room,
+                id,
+                available: bookingDotComRoom ? bookingDotComRoom.available : false
+            };
+        });
 
-        const parsedCheckIn = parseISO(checkIn);
-        const parsedCheckOut = parseISO(checkOut);
+        // Filter available rooms that can accommodate the guests
+        const availableRooms = allRooms.filter(room =>
+            room.available &&
+            room.capacities.includes(Number(guests))
+        );
 
-        if (!isValid(parsedCheckIn) || !isValid(parsedCheckOut)) {
-            return res.status(400).json({ error: 'Invalid dates' });
-        }
-
-        const available = await isDateAvailable(parsedCheckIn, parsedCheckOut);
-        if (!available) {
+        if (availableRooms.length === 0) {
             return res.json({ available: false });
         }
 
-        const nights = differenceInDays(parsedCheckOut, parsedCheckIn);
-        const rate = ROOM_TYPES[roomType].rates[guests];
-        const total = (breakfast ? rate.withBreakfast : rate.withoutBreakfast) * nights;
+        // Calculate prices for available rooms
+        const roomsWithPrices = availableRooms.map(room => {
+            const nights = differenceInDays(parseISO(checkOut), parseISO(checkIn));
+            const rate = room.rates[guests];
+            const total = (breakfast ? rate.withBreakfast : rate.withoutBreakfast) * nights;
+
+            return {
+                ...room,
+                nights,
+                total
+            };
+        });
 
         res.json({
             available: true,
-            nights,
-            total,
-            roomName: ROOM_TYPES[roomType].name
+            rooms: roomsWithPrices
         });
     } catch (error) {
+        console.error('Availability check error:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 app.post('/api/create-payment', async (req, res) => {
     try {
-        const { roomType, checkIn, checkOut, guests, breakfast, customerInfo } = req.body;
+        const {roomType, checkIn, checkOut, guests, breakfast, customerInfo} = req.body;
 
         const available = await isDateAvailable(parseISO(checkIn), parseISO(checkOut));
         if (!available) {
-            return res.status(400).json({ error: 'Selected dates are no longer available' });
+            return res.status(400).json({error: 'Selected dates are no longer available'});
         }
 
         const nights = differenceInDays(parseISO(checkOut), parseISO(checkIn));
@@ -314,7 +335,7 @@ app.post('/api/create-payment', async (req, res) => {
             paymentUrl: `${process.env.PAYMENT_URL}?amount=${total}&bookingId=${booking._id}`
         });
     } catch (error) {
-        res.status(500).json({ error: 'Failed to create payment' });
+        res.status(500).json({error: 'Failed to create payment'});
     }
 });
 
@@ -322,24 +343,24 @@ app.get('/api/booking-status/:id', async (req, res) => {
     try {
         const booking = await Booking.findById(req.params.id);
         if (!booking) {
-            return res.status(404).json({ error: 'Booking not found' });
+            return res.status(404).json({error: 'Booking not found'});
         }
         res.json(booking);
     } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch booking status' });
+        res.status(500).json({error: 'Failed to fetch booking status'});
     }
 });
 
 app.post('/api/confirm-payment', async (req, res) => {
     try {
-        const { bookingId } = req.body;
+        const {bookingId} = req.body;
         const booking = await Booking.findByIdAndUpdate(bookingId, {
             paymentStatus: 'paid',
             paymentDate: new Date()
-        }, { new: true });
+        }, {new: true});
 
         if (!booking) {
-            return res.status(404).json({ error: 'Booking not found' });
+            return res.status(404).json({error: 'Booking not found'});
         }
 
         // Send confirmation email
@@ -347,33 +368,33 @@ app.post('/api/confirm-payment', async (req, res) => {
 
         res.json(booking);
     } catch (error) {
-        res.status(500).json({ error: 'Failed to confirm payment' });
+        res.status(500).json({error: 'Failed to confirm payment'});
     }
 });
 
 app.post('/api/send-confirmation', async (req, res) => {
     try {
-        const { bookingId } = req.body;
+        const {bookingId} = req.body;
         const booking = await Booking.findById(bookingId);
 
         if (!booking) {
-            return res.status(404).json({ error: 'Booking not found' });
+            return res.status(404).json({error: 'Booking not found'});
         }
 
         await sendConfirmationEmail(booking);
-        res.json({ success: true });
+        res.json({success: true});
     } catch (error) {
-        res.status(500).json({ error: 'Failed to send confirmation' });
+        res.status(500).json({error: 'Failed to send confirmation'});
     }
 });
 
 app.post('/api/reviews', async (req, res) => {
     try {
-        const { name, country, comment, rating } = req.body;
+        const {name, country, comment, rating} = req.body;
 
         // Validate the rating
         if (rating < 1 || rating > 5) {
-            return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+            return res.status(400).json({error: 'Rating must be between 1 and 5'});
         }
 
         const review = new Review({
@@ -387,20 +408,20 @@ app.post('/api/reviews', async (req, res) => {
         res.json(review);
     } catch (error) {
         console.error('Error saving review:', error);
-        res.status(500).json({ error: 'Failed to save review' });
+        res.status(500).json({error: 'Failed to save review'});
     }
 });
 
 app.get('/api/reviews', async (req, res) => {
     try {
         const reviews = await Review.find()
-            .sort({ createdAt: -1 })
+            .sort({createdAt: -1})
             .select('name country comment rating createdAt');
 
         res.json(reviews);
     } catch (error) {
         console.error('Error fetching reviews:', error);
-        res.status(500).json({ error: 'Failed to fetch reviews' });
+        res.status(500).json({error: 'Failed to fetch reviews'});
     }
 });
 
