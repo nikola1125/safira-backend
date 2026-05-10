@@ -1,0 +1,4 @@
+.env
+*.env
+server/.env
+node_modules/
