@@ -8,24 +8,50 @@ const axios = require('axios');
 const ical = require('node-ical');
 const {differenceInDays, parseISO, isValid} = require('date-fns');
 const nodemailer = require('nodemailer');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
-// const app = express();
-// app.use(cors());
-// app.use(bodyParser.json());
-//
-// mongoose.connect(process.env.MONGODB_URI, {
-//     useNewUrlParser: true,
-//     useUnifiedTopology: true
-// });
 
 const app = express()
-app.use(cors())
-app.use(bodyParser.json())
 
-mongoose.connect(process.env.MONGODB_URI,{
-    useNewUrlParser:true,
-    useUnifiedTopology: true
-})
+app.use(helmet())
+
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : ['http://localhost:5173'];
+
+const corsOptions = {
+    origin: (origin, cb) => {
+        if (!origin || allowedOrigins.includes(origin)) cb(null, true);
+        else cb(new Error('Not allowed by CORS'));
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+app.use(bodyParser.json({ limit: '10kb' }))
+
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' }
+});
+const reviewLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: { error: 'Review limit reached. Please wait before submitting again.' }
+});
+app.use('/api/', apiLimiter);
+
+mongoose.connect(process.env.MONGODB_URI)
+    .then(() => console.log('MongoDB connected'))
+    .catch(err => { console.error('MongoDB connection error:', err); process.exit(1); })
 
 const bookingSchema = new mongoose.Schema({
     roomType: String,
@@ -389,12 +415,20 @@ app.post('/api/send-confirmation', async (req, res) => {
     }
 });
 
-app.post('/api/reviews', async (req, res) => {
+app.post('/api/reviews', reviewLimiter, async (req, res) => {
     try {
         const {name, country, comment, rating} = req.body;
 
-        // Validate the rating
-        if (rating < 1 || rating > 5) {
+        if (!name || !comment || !rating) {
+            return res.status(400).json({error: 'Name, comment and rating are required'});
+        }
+        if (typeof name !== 'string' || name.length > 100) {
+            return res.status(400).json({error: 'Invalid name'});
+        }
+        if (typeof comment !== 'string' || comment.length > 2000) {
+            return res.status(400).json({error: 'Comment too long'});
+        }
+        if (typeof rating !== 'number' || rating < 1 || rating > 5) {
             return res.status(400).json({error: 'Rating must be between 1 and 5'});
         }
 
@@ -427,4 +461,4 @@ app.get('/api/reviews', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`));
