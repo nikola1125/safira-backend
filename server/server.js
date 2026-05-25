@@ -23,7 +23,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
 const corsOptions = {
     origin: (origin, cb) => {
         if (!origin || allowedOrigins.includes(origin)) cb(null, true);
-        else cb(new Error('Not allowed by CORS'));
+        else cb(Object.assign(new Error('Not allowed by CORS'), { status: 403 }));
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
