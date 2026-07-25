@@ -79,6 +79,12 @@ const reviewSchema = new mongoose.Schema({
 const Booking = mongoose.model('Booking', bookingSchema);
 const Review = mongoose.model('Review', reviewSchema);
 
+const newsletterSchema = new mongoose.Schema({
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    createdAt: { type: Date, default: Date.now }
+});
+const Newsletter = mongoose.model('Newsletter', newsletterSchema);
+
 // Configure email transporter
 const transporter = nodemailer.createTransport({
     host: process.env.EMAIL_HOST,
@@ -457,6 +463,22 @@ app.get('/api/reviews', async (req, res) => {
     } catch (error) {
         console.error('Error fetching reviews:', error);
         res.status(500).json({error: 'Failed to fetch reviews'});
+    }
+});
+
+app.post('/api/newsletter', async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email || typeof email !== 'string' || !email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+            return res.status(400).json({ error: 'Valid email required' });
+        }
+        await Newsletter.create({ email: email.toLowerCase().trim() });
+        res.json({ success: true });
+    } catch (error) {
+        if (error.code === 11000) {
+            return res.json({ success: true });
+        }
+        res.status(500).json({ error: 'Failed to subscribe' });
     }
 });
 
