@@ -697,7 +697,69 @@ async function seedAdmin() {
     await AdminUser.create({ email: process.env.ADMIN_EMAIL.toLowerCase(), passwordHash: hash });
     console.log('Admin account created:', process.env.ADMIN_EMAIL);
 }
-mongoose.connection.once('open', seedAdmin);
+
+// Seed initial content from frontend data (runs once on startup)
+async function seedContent() {
+    const existingRooms = await ContentBlock.findOne({ key: 'rooms' });
+    if (existingRooms) return; // Already seeded
+
+    const initialRooms = [
+        {
+            id: crypto.randomUUID(),
+            slug: 'olive-room',
+            title: 'Olive Room - Garden View',
+            desc: 'Start your morning with a sea breeze on your private balcony overlooking the garden.',
+            img: './dhome4.webp',
+            images: ['./dhome4.webp', './dhome5.webp', './dhome6.webp', './banjo5.webp'],
+            highlights: ['King Size', 'En-suite', 'Sea Balcony'],
+        },
+        {
+            id: crypto.randomUUID(),
+            slug: 'lavender-room',
+            title: 'Lavender Room - Balcony Bliss',
+            desc: 'Spacious and versatile — perfect for small families or close friends.',
+            img: './rooms/Lavander.webp',
+            images: ['./rooms/Lavander.webp', './rooms/Lavander1.webp', './rooms/Lavander2.webp', './rooms/Lavander3.webp', './rooms/Lavander4.webp', './rooms/Lavander5.webp', './rooms/Lavander6.webp'],
+            highlights: ['Extra Bed', 'En-suite', 'Garden View'],
+        },
+        {
+            id: crypto.randomUUID(),
+            slug: 'backyard-bliss',
+            title: 'Backyard Bliss',
+            desc: 'Our signature space — flooded with natural light and featuring curated local art.',
+            img: './rooms/BackyardBliss4.webp',
+            images: ['./rooms/BackyardBliss4.webp', './rooms/BackyardBliss3.webp', './rooms/BackyardBliss5.webp', './rooms/BackyardBliss6.webp', './rooms/BackyardBliss7.webp', './rooms/BackYardBliss1.webp', './rooms/BackjardBliss2.webp'],
+            highlights: ['King Size', 'En-suite', 'Garden View'],
+        },
+        {
+            id: crypto.randomUUID(),
+            slug: 'deluxe-family-suite',
+            title: 'Deluxe Family Suite',
+            desc: 'The ultimate retreat — two connected spaces offering privacy and shared comfort.',
+            img: './rooms/DeluxeFamilySuite3.webp',
+            images: ['./rooms/DeluxeFamilySuite3.webp', './rooms/DeluxeFamilySuite4.webp', './rooms/DeluxeFamilySuite5.webp', './rooms/DeluxeFamilySuite6.webp', './rooms/DeluxeFamilySuite7.webp', './rooms/DeluxeFamilySuite8.webp', './rooms/DeluxeFamilySuite9.webp', './rooms/DeluxeFamilySuite10.webp', './rooms/DeluxeFamilySuite11.webp', './rooms/DeluxeFamilySuite12.webp', './rooms/DeluxeFamilySuite1.webp', './rooms/DeluxeFamilySuite2.webp'],
+            highlights: ['King Size', 'En-suite', 'Suite Layout'],
+        },
+    ];
+
+    const initialGallery = [
+        './jasht3.webp', './dhome3.webp', './dhome1.webp', './dhome2.webp',
+        './dhome.webp', './dhome4.webp', './dhome5.webp', './dhome6.webp',
+        './dhome8.webp', './dhome10.webp', './dhome11.webp', './dhome12.webp',
+        './dhome13.webp', './banjo7.webp', './banjo2.webp', './banjo5.webp',
+        './banjo6.webp', './kuzhin77.webp', './kuzhin.webp', './kuzhin78.webp',
+        './jasht1.webp', './jasht2.webp', './jasht4.webp', './jasht5.webp',
+    ];
+
+    await ContentBlock.create({ key: 'rooms', data: initialRooms });
+    await ContentBlock.create({ key: 'gallery', data: initialGallery });
+    console.log('Initial content seeded: rooms and gallery');
+}
+
+mongoose.connection.once('open', async () => {
+    await seedAdmin();
+    await seedContent();
+});
 
 // ─── Admin Content CRUD ────────────────────────────────────────────────────────
 
