@@ -13,7 +13,7 @@ const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 
 
 const app = express()
@@ -763,8 +763,15 @@ app.post('/api/admin/upload', requireAdmin, upload.single('file'), async (req, r
     try {
         if (!req.file) return res.status(400).json({ error: 'No file provided' });
         
+        // Get optional roomSlug from query or body
+        const roomSlug = req.query.roomSlug || req.body.roomSlug;
+        
         const fileName = `${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-        const key = `villa-images/${fileName}`;
+        
+        // Organize into folders: if roomSlug provided, put in rooms/{slug}/, otherwise in root
+        const key = roomSlug 
+            ? `villa-images/rooms/${roomSlug}/${fileName}`
+            : `villa-images/${fileName}`;
         
         const command = new PutObjectCommand({
             Bucket: process.env.R2_BUCKET_NAME,
@@ -800,6 +807,31 @@ app.delete('/api/admin/upload/:imageId', requireAdmin, async (req, res) => {
     } catch (err) {
         console.error('R2 delete error:', err);
         res.status(500).json({ error: 'Failed to delete image' });
+    }
+});
+
+// List images from a room folder (public endpoint)
+app.get('/api/rooms/:slug/images', async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const prefix = `villa-images/rooms/${slug}/`;
+        
+        const command = new ListObjectsV2Command({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Prefix: prefix,
+        });
+        
+        const response = await r2Client.send(command);
+        
+        // Convert S3 objects to image URLs
+        const images = (response.Contents || [])
+            .filter(obj => obj.Key && !obj.Key.endsWith('/')) // Exclude folders
+            .map(obj => `${process.env.R2_PUBLIC_URL}/${obj.Key}`);
+        
+        res.json({ images });
+    } catch (err) {
+        console.error('R2 list error:', err);
+        res.status(500).json({ error: 'Failed to list images', images: [] });
     }
 });
 
