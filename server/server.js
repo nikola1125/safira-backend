@@ -10,11 +10,21 @@ const {differenceInDays, parseISO, isValid} = require('date-fns');
 const nodemailer = require('nodemailer');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 
 
 const app = express()
 
-app.use(helmet())
+app.use(helmet({
+    contentSecurityPolicy: false, // Allow inline scripts for admin dashboard
+    crossOriginEmbedderPolicy: false, // Allow image loading from R2
+}))
+
+// Trust proxy for rate limiting behind reverse proxy (OVH/Cloudflare)
+app.set('trust proxy', 1)
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
@@ -47,6 +57,12 @@ const reviewLimiter = rateLimit({
     max: 5,
     message: { error: 'Review limit reached. Please wait before submitting again.' }
 });
+const loginLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 5, // 5 attempts per hour per IP
+    skipSuccessfulRequests: true, // Only count failed attempts
+    message: { error: 'Too many login attempts. Please try again in 1 hour.' }
+});
 app.use('/api/', apiLimiter);
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -73,6 +89,7 @@ const reviewSchema = new mongoose.Schema({
     country: String,
     comment: String,
     rating: {type: Number, min: 1, max: 5},
+    published: { type: Boolean, default: false },
     createdAt: {type: Date, default: Date.now}
 });
 
@@ -84,6 +101,59 @@ const newsletterSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const Newsletter = mongoose.model('Newsletter', newsletterSchema);
+
+// ─── CMS Models ────────────────────────────────────────────────────────────────
+
+const adminUserSchema = new mongoose.Schema({
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    passwordHash: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now }
+});
+const AdminUser = mongoose.model('AdminUser', adminUserSchema);
+
+const contentBlockSchema = new mongoose.Schema({
+    key: { type: String, required: true, unique: true },
+    data: { type: mongoose.Schema.Types.Mixed, default: {} },
+    updatedAt: { type: Date, default: Date.now }
+});
+const ContentBlock = mongoose.model('ContentBlock', contentBlockSchema);
+
+const loginAttemptSchema = new mongoose.Schema({
+    email: { type: String, required: true },
+    ip: { type: String, required: true },
+    userAgent: String,
+    success: { type: Boolean, required: true },
+    timestamp: { type: Date, default: Date.now }
+});
+loginAttemptSchema.index({ timestamp: -1 }); // For faster queries
+const LoginAttempt = mongoose.model('LoginAttempt', loginAttemptSchema);
+
+const blockedIpSchema = new mongoose.Schema({
+    ip: { type: String, required: true, unique: true },
+    type: { type: String, enum: ['ip', 'tracker'], default: 'ip' },
+    reason: String,
+    blockedAt: { type: Date, default: Date.now },
+    blockedBy: String,
+    expiresAt: { type: Date, default: null }, // null = permanent
+    duration: String // "24h", "1w", "permanent"
+});
+const BlockedIP = mongoose.model('BlockedIP', blockedIpSchema);
+
+const incidentSchema = new mongoose.Schema({
+    ip: { type: String, required: true },
+    tracker: String, // User identifier/tracker
+    actor: String, // Human-readable name
+    failedAttempts: { type: Number, default: 0 },
+    rateLimit: { type: Number, default: 5 }, // Rate limit threshold
+    status: { type: String, enum: ['ongoing', 'resolved', 'muted'], default: 'ongoing' },
+    firstSeen: { type: Date, default: Date.now },
+    lastSeen: { type: Date, default: Date.now },
+    endpoint: { type: String, default: 'POST /api/admin/login' },
+    resolvedAt: Date,
+    resolvedBy: String
+});
+incidentSchema.index({ status: 1, lastSeen: -1 });
+const Incident = mongoose.model('Incident', incidentSchema);
 
 // Configure email transporter
 const transporter = nodemailer.createTransport({
@@ -455,7 +525,7 @@ app.post('/api/reviews', reviewLimiter, async (req, res) => {
 
 app.get('/api/reviews', async (req, res) => {
     try {
-        const reviews = await Review.find()
+        const reviews = await Review.find({ published: true })
             .sort({createdAt: -1})
             .select('name country comment rating createdAt');
 
@@ -479,6 +549,475 @@ app.post('/api/newsletter', async (req, res) => {
             return res.json({ success: true });
         }
         res.status(500).json({ error: 'Failed to subscribe' });
+    }
+});
+
+// ─── Public Content API ────────────────────────────────────────────────────────
+
+app.get('/api/content/:key', async (req, res) => {
+    try {
+        const block = await ContentBlock.findOne({ key: req.params.key });
+        if (!block) return res.json({ data: null });
+        res.json({ data: block.data, updatedAt: block.updatedAt });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch content' });
+    }
+});
+
+// ─── Admin Auth ────────────────────────────────────────────────────────────────
+
+// R2 client (S3-compatible)
+const r2Client = new S3Client({
+    region: 'auto',
+    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+    }
+});
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/')) cb(null, true);
+        else cb(new Error('Only image files are allowed'));
+    }
+});
+
+const requireAdmin = (req, res, next) => {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    try {
+        req.admin = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
+        next();
+    } catch {
+        res.status(401).json({ error: 'Invalid or expired token' });
+    }
+};
+
+// Middleware to check if IP is blocked
+const checkBlockedIP = async (req, res, next) => {
+    try {
+        const blocked = await BlockedIP.findOne({ ip: req.ip });
+        if (blocked) {
+            // Check if block has expired
+            if (blocked.expiresAt && blocked.expiresAt < new Date()) {
+                await BlockedIP.deleteOne({ _id: blocked._id });
+                console.log(`Expired block removed for IP: ${req.ip}`);
+                return next();
+            }
+            console.warn(`Blocked IP attempted access: ${req.ip}`);
+            return res.status(403).json({ error: 'Access denied. Your IP has been blocked.' });
+        }
+        next();
+    } catch (err) {
+        next(); // Continue even if check fails
+    }
+};
+
+// Helper to update or create incident
+const trackIncident = async (ip, success) => {
+    if (success) return; // Only track failed attempts
+    
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const recentAttempts = await LoginAttempt.countDocuments({
+        ip,
+        success: false,
+        timestamp: { $gte: oneHourAgo }
+    });
+    
+    // Create/update incident if failed attempts >= 3
+    if (recentAttempts >= 3) {
+        await Incident.findOneAndUpdate(
+            { ip, status: 'ongoing' },
+            {
+                ip,
+                tracker: `user:${ip.replace(/\./g, '')}`,
+                actor: `User ${ip}`,
+                failedAttempts: recentAttempts,
+                lastSeen: new Date(),
+                endpoint: 'POST /api/admin/login'
+            },
+            { upsert: true, new: true }
+        );
+    }
+};
+
+app.post('/api/admin/login', checkBlockedIP, loginLimiter, async (req, res) => {
+    const clientIp = req.ip;
+    const userAgent = req.headers['user-agent'] || 'Unknown';
+    
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password required' });
+        }
+        
+        const admin = await AdminUser.findOne({ email: email.toLowerCase().trim() });
+        if (!admin) {
+            // Log failed attempt
+            await LoginAttempt.create({ email, ip: clientIp, userAgent, success: false });
+            await trackIncident(clientIp, false);
+            await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 1000));
+            console.warn(`Failed login attempt for non-existent user: ${email} from IP: ${clientIp}`);
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const valid = await bcrypt.compare(password, admin.passwordHash);
+        if (!valid) {
+            // Log failed attempt
+            await LoginAttempt.create({ email, ip: clientIp, userAgent, success: false });
+            await trackIncident(clientIp, false);
+            await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 1000));
+            console.warn(`Failed login attempt for ${email} from IP: ${clientIp}`);
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Log successful attempt
+        await LoginAttempt.create({ email, ip: clientIp, userAgent, success: true });
+        await trackIncident(clientIp, true);
+        const token = jwt.sign({ id: admin._id, email: admin.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
+        console.log(`Successful login: ${email} from IP: ${clientIp}`);
+        res.json({ token });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: 'Login failed' });
+    }
+});
+
+// Seed the first admin account from env vars (runs once on startup)
+async function seedAdmin() {
+    if (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD) return;
+    const existing = await AdminUser.findOne({ email: process.env.ADMIN_EMAIL.toLowerCase() });
+    if (existing) return;
+    const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
+    await AdminUser.create({ email: process.env.ADMIN_EMAIL.toLowerCase(), passwordHash: hash });
+    console.log('Admin account created:', process.env.ADMIN_EMAIL);
+}
+mongoose.connection.once('open', seedAdmin);
+
+// ─── Admin Content CRUD ────────────────────────────────────────────────────────
+
+const VALID_CONTENT_KEYS = ['hero', 'story', 'highlights', 'rooms', 'amenities', 'gallery', 'cta', 'footer', 'global'];
+
+app.get('/api/admin/content/:key', requireAdmin, async (req, res) => {
+    if (!VALID_CONTENT_KEYS.includes(req.params.key)) {
+        return res.status(400).json({ error: 'Invalid content key' });
+    }
+    try {
+        const block = await ContentBlock.findOne({ key: req.params.key });
+        res.json({ data: block ? block.data : null, updatedAt: block ? block.updatedAt : null });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch content' });
+    }
+});
+
+app.put('/api/admin/content/:key', requireAdmin, async (req, res) => {
+    if (!VALID_CONTENT_KEYS.includes(req.params.key)) {
+        return res.status(400).json({ error: 'Invalid content key' });
+    }
+    try {
+        const block = await ContentBlock.findOneAndUpdate(
+            { key: req.params.key },
+            { data: req.body.data, updatedAt: new Date() },
+            { upsert: true, new: true }
+        );
+        res.json({ data: block.data, updatedAt: block.updatedAt });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to save content' });
+    }
+});
+
+// ─── Admin Rooms (convenience wrapper) ───────────────────────────────────────
+
+app.get('/api/admin/rooms', requireAdmin, async (req, res) => {
+    try {
+        const block = await ContentBlock.findOne({ key: 'rooms' });
+        res.json({ rooms: block ? block.data : [] });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch rooms' });
+    }
+});
+
+app.put('/api/admin/rooms', requireAdmin, async (req, res) => {
+    try {
+        const { rooms } = req.body;
+        if (!Array.isArray(rooms)) return res.status(400).json({ error: 'rooms must be an array' });
+        const block = await ContentBlock.findOneAndUpdate(
+            { key: 'rooms' },
+            { data: rooms, updatedAt: new Date() },
+            { upsert: true, new: true }
+        );
+        res.json({ rooms: block.data });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to save rooms' });
+    }
+});
+
+// ─── Admin Image Upload (R2) ──────────────────────────────────────────────────
+
+app.post('/api/admin/upload', requireAdmin, upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file provided' });
+        
+        const fileName = `${Date.now()}-${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+        const key = `villa-images/${fileName}`;
+        
+        const command = new PutObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: key,
+            Body: req.file.buffer,
+            ContentType: req.file.mimetype,
+        });
+        
+        await r2Client.send(command);
+        
+        // Return the public URL (requires R2 bucket to have public access enabled)
+        const url = `${process.env.R2_PUBLIC_URL}/${key}`;
+        res.json({ url, id: key });
+    } catch (err) {
+        console.error('R2 upload error:', err);
+        res.status(500).json({ error: 'Image upload failed' });
+    }
+});
+
+// Delete image from R2
+app.delete('/api/admin/upload/:imageId', requireAdmin, async (req, res) => {
+    try {
+        // imageId is the full key path
+        const key = decodeURIComponent(req.params.imageId);
+        
+        const command = new DeleteObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: key,
+        });
+        
+        await r2Client.send(command);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('R2 delete error:', err);
+        res.status(500).json({ error: 'Failed to delete image' });
+    }
+});
+
+// ─── Admin Reviews ─────────────────────────────────────────────────────────────
+
+app.get('/api/admin/reviews', requireAdmin, async (req, res) => {
+    try {
+        const reviews = await Review.find().sort({ createdAt: -1 });
+        res.json(reviews);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch reviews' });
+    }
+});
+
+app.patch('/api/admin/reviews/:id', requireAdmin, async (req, res) => {
+    try {
+        const { published } = req.body;
+        const review = await Review.findByIdAndUpdate(
+            req.params.id,
+            { published: Boolean(published) },
+            { new: true }
+        );
+        if (!review) return res.status(404).json({ error: 'Review not found' });
+        res.json(review);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update review' });
+    }
+});
+
+app.delete('/api/admin/reviews/:id', requireAdmin, async (req, res) => {
+    try {
+        await Review.findByIdAndDelete(req.params.id);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to delete review' });
+    }
+});
+
+// ─── Admin Dashboard Stats ────────────────────────────────────────────────────
+
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+    try {
+        const [reviewCount, pendingReviews, subscribers] = await Promise.all([
+            Review.countDocuments(),
+            Review.countDocuments({ published: false }),
+            Newsletter.countDocuments()
+        ]);
+        res.json({ reviewCount, pendingReviews, subscribers });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch stats' });
+    }
+});
+
+// ─── Admin Security Incidents & IP Blocking ────────────────────────────────────
+
+app.get('/api/admin/incidents', requireAdmin, async (req, res) => {
+    try {
+        const [ongoing, past] = await Promise.all([
+            Incident.find({ status: 'ongoing' }).sort({ lastSeen: -1 }).lean(),
+            Incident.find({ status: { $in: ['resolved', 'muted'] } }).sort({ resolvedAt: -1 }).limit(50).lean()
+        ]);
+        
+        res.json({ ongoing, past });
+    } catch (err) {
+        console.error('Incidents fetch error:', err);
+        res.status(500).json({ error: 'Failed to fetch incidents' });
+    }
+});
+
+app.post('/api/admin/incidents/:id/resolve', requireAdmin, async (req, res) => {
+    try {
+        const incident = await Incident.findByIdAndUpdate(
+            req.params.id,
+            { 
+                status: 'resolved',
+                resolvedAt: new Date(),
+                resolvedBy: req.admin.email
+            },
+            { new: true }
+        );
+        res.json(incident);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to resolve incident' });
+    }
+});
+
+app.post('/api/admin/incidents/:id/mute', requireAdmin, async (req, res) => {
+    try {
+        const incident = await Incident.findByIdAndUpdate(
+            req.params.id,
+            { 
+                status: 'muted',
+                resolvedAt: new Date(),
+                resolvedBy: req.admin.email
+            },
+            { new: true }
+        );
+        res.json(incident);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to mute incident' });
+    }
+});
+
+app.post('/api/admin/incidents/:id/blacklist', requireAdmin, async (req, res) => {
+    try {
+        const incident = await Incident.findById(req.params.id);
+        if (!incident) return res.status(404).json({ error: 'Incident not found' });
+        
+        const { duration = '24h', reason } = req.body;
+        
+        let expiresAt = null;
+        let durationLabel = 'permanent';
+        
+        if (duration !== 'permanent') {
+            const durationMap = {
+                '24h': 24 * 60 * 60 * 1000,
+                '1w': 7 * 24 * 60 * 60 * 1000,
+                '1m': 30 * 24 * 60 * 60 * 1000
+            };
+            if (durationMap[duration]) {
+                expiresAt = new Date(Date.now() + durationMap[duration]);
+                durationLabel = duration;
+            }
+        }
+        
+        const blocked = await BlockedIP.findOneAndUpdate(
+            { ip: incident.ip },
+            { 
+                ip: incident.ip,
+                type: 'ip',
+                reason: reason || `Incident #${incident._id} - ${incident.failedAttempts} failed attempts`,
+                blockedBy: req.admin.email,
+                blockedAt: new Date(),
+                expiresAt,
+                duration: durationLabel
+            },
+            { upsert: true, new: true }
+        );
+        
+        // Mark incident as resolved
+        await Incident.findByIdAndUpdate(req.params.id, {
+            status: 'resolved',
+            resolvedAt: new Date(),
+            resolvedBy: req.admin.email
+        });
+        
+        console.log(`IP ${incident.ip} blacklisted by ${req.admin.email} (${durationLabel})`);
+        res.json(blocked);
+    } catch (err) {
+        console.error('Blacklist error:', err);
+        res.status(500).json({ error: 'Failed to blacklist' });
+    }
+});
+
+app.get('/api/admin/blocked-ips', requireAdmin, async (req, res) => {
+    try {
+        // Clean up expired blocks first
+        await BlockedIP.deleteMany({
+            expiresAt: { $ne: null, $lt: new Date() }
+        });
+        
+        const blocked = await BlockedIP.find().sort({ blockedAt: -1 });
+        res.json(blocked);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch blocked IPs' });
+    }
+});
+
+app.post('/api/admin/block-ip', requireAdmin, async (req, res) => {
+    try {
+        const { ip, reason, duration = 'permanent' } = req.body;
+        if (!ip) return res.status(400).json({ error: 'IP address required' });
+        
+        let expiresAt = null;
+        let durationLabel = 'permanent';
+        
+        if (duration !== 'permanent') {
+            const durationMap = {
+                '24h': 24 * 60 * 60 * 1000,
+                '1w': 7 * 24 * 60 * 60 * 1000,
+                '1m': 30 * 24 * 60 * 60 * 1000
+            };
+            if (durationMap[duration]) {
+                expiresAt = new Date(Date.now() + durationMap[duration]);
+                durationLabel = duration;
+            }
+        }
+        
+        const blocked = await BlockedIP.findOneAndUpdate(
+            { ip },
+            { 
+                ip,
+                type: 'ip',
+                reason: reason || 'Blocked by admin',
+                blockedBy: req.admin.email,
+                blockedAt: new Date(),
+                expiresAt,
+                duration: durationLabel
+            },
+            { upsert: true, new: true }
+        );
+        
+        console.log(`IP ${ip} blocked by ${req.admin.email} (${durationLabel}). Reason: ${reason || 'None'}`);
+        res.json(blocked);
+    } catch (err) {
+        console.error('Block IP error:', err);
+        res.status(500).json({ error: 'Failed to block IP' });
+    }
+});
+
+app.delete('/api/admin/block-ip/:ip', requireAdmin, async (req, res) => {
+    try {
+        const ip = req.params.ip;
+        await BlockedIP.deleteOne({ ip });
+        console.log(`IP ${ip} unblocked by ${req.admin.email}`);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to unblock IP' });
     }
 });
 
