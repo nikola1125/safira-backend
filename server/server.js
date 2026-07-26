@@ -646,7 +646,7 @@ const trackIncident = async (ip, success) => {
     }
 };
 
-app.post('/api/admin/login', /* checkBlockedIP, */ /* loginLimiter, */ async (req, res) => {
+app.post('/api/admin/login', checkBlockedIP, loginLimiter, async (req, res) => {
     const clientIp = req.ip;
     const userAgent = req.headers['user-agent'] || 'Unknown';
     
